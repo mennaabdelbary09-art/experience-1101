@@ -1,0 +1,402 @@
+"""
+Input validation utilities for Returno Face Recognition System
+Implements comprehensive validation to prevent SQL injection and XSS
+"""
+
+import re
+import logging
+from datetime import datetime
+from functools import wraps
+from flask import request, jsonify
+from marshmallow import Schema, fields, validates, ValidationError, validates_schema
+
+logger = logging.getLogger(__name__)
+
+
+# Regular expressions for validation
+PATTERNS = {
+    'email': re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
+    'phone': re.compile(r'^\+?[0-9]{10,15}$'),
+    'national_id': re.compile(r'^[0-9]{14}$'),  # Egyptian national ID format
+    'username': re.compile(r'^[a-zA-Z0-9_-]{3,30}$'),
+    'name': re.compile(r'^[a-zA-Z\s\-\']{2,100}$'),
+    'alphanumeric': re.compile(r'^[a-zA-Z0-9\s]+$'),
+}
+
+
+class ValidationError(Exception):
+    """Custom validation error"""
+    pass
+
+
+def validate_required(value, field_name):
+    """Validate that a field is present and not empty"""
+    if value is None or (isinstance(value, str) and value.strip() == ''):
+        raise ValidationError(f"{field_name} is required")
+    return True
+
+
+def validate_string_length(value, field_name, min_length=1, max_length=1000):
+    """Validate string length"""
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    
+    length = len(value)
+    if length < min_length:
+        raise ValidationError(f"{field_name} must be at least {min_length} characters")
+    
+    if length > max_length:
+        raise ValidationError(f"{field_name} must not exceed {max_length} characters")
+    
+    return True
+
+
+def validate_pattern(value, pattern, field_name, pattern_name):
+    """Validate against regex pattern"""
+    if not PATTERNS.get(pattern, pattern).match(value):
+        raise ValidationError(f"{field_name} format is invalid ({pattern_name})")
+    return True
+
+
+def validate_email(email):
+    """Validate email format"""
+    if not email or not isinstance(email, str):
+        raise ValidationError("Email is required and must be a string")
+    
+    return validate_pattern(email, 'email', 'Email', 'example@domain.com')
+
+
+def validate_phone(phone):
+    """Validate phone number format"""
+    if not phone or not isinstance(phone, str):
+        raise ValidationError("Phone number is required and must be a string")
+    
+    # Remove spaces and dashes for validation
+    phone_clean = phone.replace(' ', '').replace('-', '')
+    return validate_pattern(phone_clean, 'phone', 'Phone number', '+1234567890')
+
+
+def validate_national_id(national_id):
+    """Validate national ID format"""
+    if not national_id or not isinstance(national_id, str):
+        raise ValidationError("National ID is required and must be a string")
+    
+    return validate_pattern(national_id, 'national_id', 'National ID', '14 digits')
+
+
+def validate_age(age):
+    """Validate age value"""
+    if not isinstance(age, int):
+        try:
+            age = int(age)
+        except (ValueError, TypeError):
+            raise ValidationError("Age must be a number")
+    
+    if age < 0 or age > 150:
+        raise ValidationError("Age must be between 0 and 150")
+    
+    return True
+
+
+def validate_confidence_score(score):
+    """Validate confidence score (0-1)"""
+    if not isinstance(score, (int, float)):
+        raise ValidationError("Confidence score must be a number")
+    
+    if score < 0 or score > 1:
+        raise ValidationError("Confidence score must be between 0 and 1")
+    
+    return True
+
+
+def sanitize_string(value):
+    """Sanitize string input to prevent XSS"""
+    if not isinstance(value, str):
+        return value
+    
+    # Remove any HTML tags
+    value = re.sub(r'<[^>]*>', '', value)
+    
+    # Remove any script content
+    value = re.sub(r'<script.*?</script>', '', value, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Escape special characters
+    replacements = {
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#x27;',
+        '/': '&#x2F;',
+    }
+    
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    
+    return value.strip()
+
+
+def validate_file_upload(file, allowed_extensions, max_size_mb=16):
+    """Validate uploaded file"""
+    if not file:
+        raise ValidationError("No file provided")
+    
+    if file.filename == '':
+        raise ValidationError("Empty filename")
+    
+    # Check extension
+    extension = file.filename.rsplit('.', 1)[-1].lower()
+    if extension not in allowed_extensions:
+        raise ValidationError(
+            f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+    
+    # Check file size
+    file.seek(0, 2)  # Seek to end
+    size_bytes = file.tell()
+    file.seek(0)  # Reset to beginning
+    
+    max_bytes = max_size_mb * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise ValidationError(f"File size exceeds {max_size_mb}MB limit")
+    
+    return True
+
+
+# Marshmallow Schemas for request validation
+
+class ReportMissingPersonSchema(Schema):
+    """Schema for missing person report submission"""
+    
+    # Guardian info
+    guardian_name = fields.Str(required=True)
+    guardian_age = fields.Int(required=True)
+    guardian_national_id = fields.Str(required=True)
+    guardian_phone = fields.Str(required=True)
+    relationship = fields.Str(required=True)
+    
+    # Missing person info
+    missing_name = fields.Str(required=True)
+    missing_age = fields.Int(required=True)
+    missing_national_id = fields.Str(required=False, allow_none=True)
+    last_seen_location = fields.Str(required=True)
+    last_seen_date = fields.DateTime(required=False, allow_none=True)
+    description = fields.Str(required=True)
+    
+    # Photos (base64 encoded)
+    photos = fields.List(fields.Str(), required=True)
+    
+    @validates('guardian_age')
+    def validate_guardian_age(self, value):
+        if value < 18 or value > 150:
+            raise ValidationError("Guardian age must be between 18 and 150")
+    
+    @validates('missing_age')
+    def validate_missing_age(self, value):
+        if value < 0 or value > 150:
+            raise ValidationError("Missing person age must be between 0 and 150")
+    
+    @validates('guardian_phone')
+    def validate_phone_field(self, value):
+        validate_phone(value)
+    
+    @validates('guardian_national_id')
+    def validate_national_id_field(self, value):
+        validate_national_id(value)
+    
+    @validates_schema
+    def validate_schema(self, data, **kwargs):
+        # Ensure at least one photo
+        if not data.get('photos') or len(data['photos']) == 0:
+            raise ValidationError("At least one photo is required")
+        
+        # Validate photo count
+        if len(data['photos']) > 5:
+            raise ValidationError("Maximum 5 photos allowed")
+
+
+class SearchByPhotoSchema(Schema):
+    """Schema for search by photo request"""
+    photo = fields.Str(required=True)
+    
+    @validates('photo')
+    def validate_photo_format(self, value):
+        if not value.startswith('data:image/'):
+            raise ValidationError("Invalid photo format")
+
+
+class MatchApprovalSchema(Schema):
+    """Schema for match approval"""
+    match_id = fields.Int(required=True)
+    action = fields.Str(required=True)
+    notes = fields.Str(required=False, allow_none=True)
+    
+    @validates('action')
+    def validate_action(self, value):
+        if value not in ['approve', 'reject', 'false_positive']:
+            raise ValidationError("Action must be 'approve', 'reject', or 'false_positive'")
+
+
+class UserRegistrationSchema(Schema):
+    """Schema for user registration"""
+    username = fields.Str(required=True)
+    email = fields.Email(required=True)
+    password = fields.Str(required=True)
+    full_name = fields.Str(required=True)
+    phone = fields.Str(required=False, allow_none=True)
+    
+    @validates('username')
+    def validate_username_format(self, value):
+        if not PATTERNS['username'].match(value):
+            raise ValidationError(
+                "Username must be 3-30 characters, alphanumeric, dash or underscore only"
+            )
+    
+    @validates('password')
+    def validate_password_strength(self, value):
+        if len(value) < 8:
+            raise ValidationError("Password must be at least 8 characters")
+        
+        # Check for at least one digit and one letter
+        if not any(c.isdigit() for c in value):
+            raise ValidationError("Password must contain at least one digit")
+        
+        if not any(c.isalpha() for c in value):
+            raise ValidationError("Password must contain at least one letter")
+
+
+class UserLoginSchema(Schema):
+    """Schema for user login"""
+    username = fields.Str(required=True)
+    password = fields.Str(required=True)
+
+
+# Decorator for automatic request validation
+def validate_request(schema_class):
+    """Decorator to validate request data against schema"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                # Get JSON data from request
+                if not request.is_json:
+                    return jsonify({
+                        'success': False,
+                        'message': 'Request must be JSON'
+                    }), 400
+                
+                data = request.get_json()
+                
+                # Validate against schema
+                schema = schema_class()
+                validated_data = schema.load(data)
+                
+                # Add validated data to kwargs
+                kwargs['validated_data'] = validated_data
+                
+                return func(*args, **kwargs)
+                
+            except ValidationError as e:
+                logger.warning(f"Validation error: {e.messages}")
+                return jsonify({
+                    'success': False,
+                    'message': 'Validation failed',
+                    'errors': e.messages
+                }), 400
+            
+            except Exception as e:
+                logger.error(f"Request validation error: {e}")
+                return jsonify({
+                    'success': False,
+                    'message': 'Invalid request'
+                }), 400
+        
+        return wrapper
+    return decorator
+
+
+def validate_sql_injection(value):
+    """Check for potential SQL injection patterns"""
+    if not isinstance(value, str):
+        return True
+    
+    # Dangerous SQL keywords and patterns
+    dangerous_patterns = [
+        r"(\bunion\b.*\bselect\b)",
+        r"(\bselect\b.*\bfrom\b)",
+        r"(\binsert\b.*\binto\b)",
+        r"(\bdelete\b.*\bfrom\b)",
+        r"(\bdrop\b.*\btable\b)",
+        r"(\bexec\b|\bexecute\b)",
+        r"(--)",
+        r"(;.*drop)",
+        r"(;.*delete)",
+    ]
+    
+    value_lower = value.lower()
+    for pattern in dangerous_patterns:
+        if re.search(pattern, value_lower, re.IGNORECASE):
+            logger.warning(f"Potential SQL injection attempt detected: {value}")
+            raise ValidationError("Invalid input detected")
+    
+    return True
+
+
+def clean_input_dict(data, allowed_fields):
+    """Clean input dictionary to only include allowed fields"""
+    return {
+        key: sanitize_string(value) if isinstance(value, str) else value
+        for key, value in data.items()
+        if key in allowed_fields
+    }
+
+
+class InputValidator:
+    """Centralized input validation class"""
+    
+    @staticmethod
+    def validate_report_data(data):
+        """Validate missing person report data"""
+        schema = ReportMissingPersonSchema()
+        return schema.load(data)
+    
+    @staticmethod
+    def validate_search_data(data):
+        """Validate search request data"""
+        schema = SearchByPhotoSchema()
+        return schema.load(data)
+    
+    @staticmethod
+    def validate_user_registration(data):
+        """Validate user registration data"""
+        schema = UserRegistrationSchema()
+        return schema.load(data)
+    
+    @staticmethod
+    def validate_user_login(data):
+        """Validate user login data"""
+        schema = UserLoginSchema()
+        return schema.load(data)
+
+
+if __name__ == "__main__":
+    # Test validation functions
+    print("Testing validation utilities...")
+    
+    # Test email validation
+    try:
+        validate_email("test@example.com")
+        print("✓ Email validation passed")
+    except ValidationError as e:
+        print(f"✗ Email validation failed: {e}")
+    
+    # Test SQL injection detection
+    try:
+        validate_sql_injection("'; DROP TABLE users; --")
+        print("✗ SQL injection detection failed")
+    except ValidationError:
+        print("✓ SQL injection detected and blocked")
+    
+    # Test sanitization
+    dirty = "<script>alert('xss')</script>Hello"
+    clean = sanitize_string(dirty)
+    print(f"Sanitization: '{dirty}' -> '{clean}'")
