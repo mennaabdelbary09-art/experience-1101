@@ -1,0 +1,324 @@
+"""
+Encryption utilities for protecting PII (Personally Identifiable Information)
+Implements Fernet symmetric encryption for sensitive data
+"""
+
+import os
+import logging
+from cryptography.fernet import Fernet, InvalidToken
+from functools import wraps
+
+logger = logging.getLogger(__name__)
+
+
+class EncryptionManager:
+    """Manages encryption and decryption of sensitive data"""
+    
+    def __init__(self, encryption_key=None):
+        """Initialize encryption manager with key"""
+        if encryption_key is None:
+            # Try to get from environment
+            encryption_key = os.getenv('ENCRYPTION_KEY')
+        
+        if encryption_key is None:
+            logger.warning(
+                "No encryption key provided. Data will not be encrypted. "
+                "Generate one with: from cryptography.fernet import Fernet; print(Fernet.generate_key())"
+            )
+            self.cipher = None
+        else:
+            try:
+                # Ensure key is bytes
+                if isinstance(encryption_key, str):
+                    encryption_key = encryption_key.encode()
+                
+                self.cipher = Fernet(encryption_key)
+                logger.info("Encryption initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize encryption: {e}")
+                self.cipher = None
+    
+    def encrypt(self, plaintext):
+        """Encrypt plaintext data"""
+        if self.cipher is None:
+            logger.warning("Encryption not available, returning plaintext")
+            return plaintext
+        
+        if plaintext is None or plaintext == '':
+            return plaintext
+        
+        try:
+            # Convert to bytes if string
+            if isinstance(plaintext, str):
+                plaintext = plaintext.encode('utf-8')
+            
+            # Encrypt
+            encrypted = self.cipher.encrypt(plaintext)
+            
+            # Return as base64 string for database storage
+            return encrypted.decode('utf-8')
+            
+        except Exception as e:
+            logger.error(f"Encryption failed: {e}")
+            return plaintext
+    
+    def decrypt(self, ciphertext):
+        """Decrypt ciphertext data"""
+        if self.cipher is None:
+            logger.warning("Encryption not available, returning ciphertext")
+            return ciphertext
+        
+        if ciphertext is None or ciphertext == '':
+            return ciphertext
+        
+        try:
+            # Convert to bytes if string
+            if isinstance(ciphertext, str):
+                ciphertext = ciphertext.encode('utf-8')
+            
+            # Decrypt
+            decrypted = self.cipher.decrypt(ciphertext)
+            
+            # Return as string
+            return decrypted.decode('utf-8')
+            
+        except InvalidToken:
+            logger.error("Invalid token - data may not be encrypted or key is wrong")
+            return ciphertext
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            return ciphertext
+    
+    def encrypt_dict(self, data, fields_to_encrypt):
+        """Encrypt specific fields in a dictionary"""
+        if not isinstance(data, dict):
+            return data
+        
+        encrypted_data = data.copy()
+        
+        for field in fields_to_encrypt:
+            if field in encrypted_data and encrypted_data[field]:
+                encrypted_data[field] = self.encrypt(encrypted_data[field])
+        
+        return encrypted_data
+    
+    def decrypt_dict(self, data, fields_to_decrypt):
+        """Decrypt specific fields in a dictionary"""
+        if not isinstance(data, dict):
+            return data
+        
+        decrypted_data = data.copy()
+        
+        for field in fields_to_decrypt:
+            if field in decrypted_data and decrypted_data[field]:
+                decrypted_data[field] = self.decrypt(decrypted_data[field])
+        
+        return decrypted_data
+
+
+# Global encryption manager instance
+_encryption_manager = None
+
+
+def get_encryption_manager():
+    """Get or create global encryption manager instance"""
+    global _encryption_manager
+    
+    if _encryption_manager is None:
+        _encryption_manager = EncryptionManager()
+    
+    return _encryption_manager
+
+
+def encrypt_pii(data):
+    """Encrypt PII data"""
+    manager = get_encryption_manager()
+    return manager.encrypt(data)
+
+
+def decrypt_pii(data):
+    """Decrypt PII data"""
+    manager = get_encryption_manager()
+    return manager.decrypt(data)
+
+
+# Decorator for automatic PII encryption/decryption
+def encrypt_fields(*field_names):
+    """Decorator to automatically encrypt specified fields"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Get encryption manager
+            manager = get_encryption_manager()
+            
+            # Encrypt fields in kwargs
+            for field in field_names:
+                if field in kwargs and kwargs[field]:
+                    kwargs[field] = manager.encrypt(kwargs[field])
+            
+            return func(*args, **kwargs)
+        
+        return wrapper
+    return decorator
+
+
+class PIIField:
+    """Custom field descriptor for automatic PII encryption"""
+    
+    def __init__(self, field_name):
+        self.field_name = f"_{field_name}"
+        self.manager = get_encryption_manager()
+    
+    def __get__(self, obj, objtype=None):
+        """Decrypt on read"""
+        if obj is None:
+            return self
+        
+        encrypted_value = getattr(obj, self.field_name, None)
+        if encrypted_value:
+            return self.manager.decrypt(encrypted_value)
+        return encrypted_value
+    
+    def __set__(self, obj, value):
+        """Encrypt on write"""
+        if value:
+            value = self.manager.encrypt(value)
+        setattr(obj, self.field_name, value)
+
+
+# List of PII fields that should be encrypted
+PII_FIELDS = [
+    'national_id',
+    'guardian_national_id',
+    'missing_person_national_id',
+    'phone',
+    'guardian_phone',
+    'recipient_phone',
+    'email',
+    'recipient_email',
+]
+
+
+def mask_pii(data, mask_char='*'):
+    """Mask PII data for display purposes"""
+    if data is None or data == '':
+        return data
+    
+    if len(data) <= 4:
+        return mask_char * len(data)
+    
+    # Show first 2 and last 2 characters
+    return data[:2] + (mask_char * (len(data) - 4)) + data[-2:]
+
+
+def redact_pii_from_logs(log_message):
+    """Redact PII patterns from log messages"""
+    import re
+    
+    # Patterns to redact
+    patterns = [
+        (r'\b\d{14}\b', '[NATIONAL_ID]'),  # 14-digit national ID
+        (r'\b\d{10,11}\b', '[PHONE]'),  # Phone numbers
+        (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]'),  # Emails
+    ]
+    
+    redacted = log_message
+    for pattern, replacement in patterns:
+        redacted = re.sub(pattern, replacement, redacted)
+    
+    return redacted
+
+
+def validate_encryption_setup():
+    """Validate that encryption is properly configured"""
+    manager = get_encryption_manager()
+    
+    if manager.cipher is None:
+        return {
+            'configured': False,
+            'message': 'Encryption key not configured. PII will not be encrypted.',
+            'severity': 'warning'
+        }
+    
+    # Test encryption/decryption
+    try:
+        test_data = "test_encryption_12345"
+        encrypted = manager.encrypt(test_data)
+        decrypted = manager.decrypt(encrypted)
+        
+        if decrypted == test_data:
+            return {
+                'configured': True,
+                'message': 'Encryption working correctly',
+                'severity': 'info'
+            }
+        else:
+            return {
+                'configured': False,
+                'message': 'Encryption test failed - data mismatch',
+                'severity': 'error'
+            }
+    
+    except Exception as e:
+        return {
+            'configured': False,
+            'message': f'Encryption test failed: {str(e)}',
+            'severity': 'error'
+        }
+
+
+def generate_encryption_key():
+    """Generate a new encryption key"""
+    key = Fernet.generate_key()
+    return key.decode('utf-8')
+
+
+# Context manager for temporary decryption
+class DecryptedContext:
+    """Context manager for temporarily decrypting data"""
+    
+    def __init__(self, obj, fields):
+        self.obj = obj
+        self.fields = fields
+        self.original_values = {}
+        self.manager = get_encryption_manager()
+    
+    def __enter__(self):
+        """Decrypt fields on enter"""
+        for field in self.fields:
+            if hasattr(self.obj, field):
+                encrypted_value = getattr(self.obj, field)
+                if encrypted_value:
+                    self.original_values[field] = encrypted_value
+                    setattr(self.obj, field, self.manager.decrypt(encrypted_value))
+        
+        return self.obj
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Re-encrypt fields on exit"""
+        for field, encrypted_value in self.original_values.items():
+            setattr(self.obj, field, encrypted_value)
+
+
+if __name__ == "__main__":
+    # Test encryption functionality
+    print("Testing Encryption Manager...")
+    
+    # Generate test key
+    test_key = Fernet.generate_key()
+    print(f"Generated key: {test_key.decode()}")
+    
+    # Initialize manager
+    manager = EncryptionManager(test_key)
+    
+    # Test encryption/decryption
+    test_data = "Sensitive PII Data: 12345678901234"
+    print(f"\nOriginal: {test_data}")
+    
+    encrypted = manager.encrypt(test_data)
+    print(f"Encrypted: {encrypted}")
+    
+    decrypted = manager.decrypt(encrypted)
+    print(f"Decrypted: {decrypted}")
+    
+    print(f"\nTest {'PASSED' if decrypted == test_data else 'FAILED'}")
