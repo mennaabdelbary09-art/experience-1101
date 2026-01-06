@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""
+Database Initialization Script for Returno Face Recognition System
+Creates all tables and initializes the database with default data
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from flask import Flask
+from app.models.models import db, User, UserRole
+from config.config import get_config
+from app.utils.logging_config import setup_logging
+from app.utils.encryption import validate_encryption_setup
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def create_app():
+    """Create Flask application"""
+    app = Flask(__name__)
+    
+    # Load configuration
+    config = get_config()
+    app.config.from_object(config)
+    
+    # Initialize database
+    db.init_app(app)
+    
+    # Setup logging
+    setup_logging(app)
+    
+    return app
+
+
+def init_database(app):
+    """Initialize database with all tables"""
+    with app.app_context():
+        try:
+            print("\n" + "="*70)
+            print("🚀 Returno Database Initialization")
+            print("="*70 + "\n")
+            
+            # Create database directory if not exists
+            db_path = app.config.get('SQLALCHEMY_DATABASE_URI', '').replace('sqlite:///', '')
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                print(f"✓ Created database directory: {db_dir}")
+            
+            # Drop all tables (use with caution!)
+            print("\n⚠️  Dropping existing tables...")
+            db.drop_all()
+            print("✓ Existing tables dropped")
+            
+            # Create all tables
+            print("\n📊 Creating database tables...")
+            db.create_all()
+            print("✓ All tables created successfully")
+            
+            # Verify tables
+            from sqlalchemy import inspect
+            inspector = inspect(db.engine)
+            table_names = inspector.get_table_names()
+            
+            print(f"\n✓ Created {len(table_names)} tables:")
+            for table in sorted(table_names):
+                print(f"  • {table}")
+            
+            # Create default admin user
+            print("\n👤 Creating default admin user...")
+            create_default_admin()
+            
+            # Verify encryption
+            print("\n🔐 Validating encryption setup...")
+            encryption_status = validate_encryption_setup()
+            if encryption_status['configured']:
+                print(f"✓ {encryption_status['message']}")
+            else:
+                print(f"⚠️  {encryption_status['message']}")
+            
+            # Show database info
+            print("\n📈 Database Statistics:")
+            print(f"  • Database: {db_path}")
+            if os.path.exists(db_path):
+                size_mb = os.path.getsize(db_path) / (1024 * 1024)
+                print(f"  • Size: {size_mb:.2f} MB")
+            
+            print("\n" + "="*70)
+            print("✅ Database initialization complete!")
+            print("="*70)
+            
+            print("\n📝 Next Steps:")
+            print("  1. Change default admin password: admin123")
+            print("  2. Configure .env file with encryption key")
+            print("  3. Copy your ML models to models/ directory")
+            print("  4. Run: python app.py")
+            print()
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n❌ Error initializing database: {e}")
+            logger.exception("Database initialization failed")
+            return False
+
+
+def create_default_admin():
+    """Create default admin user"""
+    try:
+        # Check if admin exists
+        admin = User.query.filter_by(username='admin').first()
+        
+        if admin:
+            print("  ⚠️  Admin user already exists")
+            return
+        
+        # Create admin user
+        admin = User(
+            username='admin',
+            email='admin@returno.local',
+            full_name='System Administrator',
+            phone='+1234567890',
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_verified=True
+        )
+        admin.set_password('admin123')
+        
+        db.session.add(admin)
+        db.session.commit()
+        
+        print("  ✓ Admin user created")
+        print("  • Username: admin")
+        print("  • Password: admin123")
+        print("  • ⚠️  IMPORTANT: Change password in production!")
+        
+    except Exception as e:
+        print(f"  ❌ Error creating admin user: {e}")
+        db.session.rollback()
+        raise
+
+
+def create_sample_data(app):
+    """Create sample data for testing (optional)"""
+    with app.app_context():
+        try:
+            print("\n📦 Creating sample data...")
+            
+            # Create sample public user
+            from app.models.models import User, UserRole
+            
+            public_user = User.query.filter_by(username='john_doe').first()
+            if not public_user:
+                public_user = User(
+                    username='john_doe',
+                    email='john@example.com',
+                    full_name='John Doe',
+                    phone='+1987654321',
+                    role=UserRole.PUBLIC_REPORTER,
+                    is_active=True,
+                    is_verified=True
+                )
+                public_user.set_password('password123')
+                db.session.add(public_user)
+            
+            # Create sample guardian user
+            guardian = User.query.filter_by(username='jane_guardian').first()
+            if not guardian:
+                guardian = User(
+                    username='jane_guardian',
+                    email='jane@example.com',
+                    full_name='Jane Guardian',
+                    phone='+1555555555',
+                    role=UserRole.GUARDIAN,
+                    is_active=True,
+                    is_verified=True
+                )
+                guardian.set_password('password123')
+                db.session.add(guardian)
+            
+            db.session.commit()
+            print("  ✓ Sample users created")
+            
+            # Create sample success story
+            from app.models.models import SuccessStory
+            
+            story = SuccessStory.query.first()
+            if not story:
+                story = SuccessStory(
+                    title="Child Reunited with Family After 3 Days",
+                    description="Thanks to the quick response of our community and the help of facial recognition technology, an 8-year-old child was safely reunited with their family after being missing for 3 days.",
+                    age_group="child",
+                    location_general="New York City",
+                    missing_duration_days=3,
+                    is_published=True
+                )
+                db.session.add(story)
+                db.session.commit()
+                print("  ✓ Sample success story created")
+            
+            print("✓ Sample data creation complete")
+            
+        except Exception as e:
+            print(f"❌ Error creating sample data: {e}")
+            db.session.rollback()
+
+
+def verify_database(app):
+    """Verify database setup"""
+    with app.app_context():
+        try:
+            print("\n🔍 Verifying database setup...")
+            
+            # Test connection
+            db.session.execute('SELECT 1')
+            print("  ✓ Database connection working")
+            
+            # Check admin user
+            admin = User.query.filter_by(username='admin').first()
+            if admin:
+                print(f"  ✓ Admin user exists (ID: {admin.id})")
+            else:
+                print("  ⚠️  Admin user not found")
+            
+            # Count records
+            from app.models.models import (
+                User, MissingReport, FileAttachment, MatchResult,
+                Notification, ConsentLog, AuditLog
+            )
+            
+            counts = {
+                'Users': User.query.count(),
+                'Reports': MissingReport.query.count(),
+                'Attachments': FileAttachment.query.count(),
+                'Matches': MatchResult.query.count(),
+                'Notifications': Notification.query.count(),
+                'Consent Logs': ConsentLog.query.count(),
+                'Audit Logs': AuditLog.query.count()
+            }
+            
+            print("\n  📊 Record counts:")
+            for table, count in counts.items():
+                print(f"    • {table}: {count}")
+            
+            print("\n✓ Database verification complete")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Database verification failed: {e}")
+            return False
+
+
+def main():
+    """Main execution"""
+    # Create Flask app
+    app = create_app()
+    
+    # Initialize database
+    success = init_database(app)
+    
+    if not success:
+        print("\n❌ Initialization failed. Please check the errors above.")
+        sys.exit(1)
+    
+    # Ask if user wants sample data
+    response = input("\n❓ Create sample data for testing? (y/n): ").lower().strip()
+    if response == 'y':
+        create_sample_data(app)
+    
+    # Verify setup
+    verify_database(app)
+    
+    print("\n✅ All done! Your database is ready to use.")
+    print("   Start the server with: python app.py\n")
+
+
+if __name__ == "__main__":
+    main()
