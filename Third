@@ -1,0 +1,290 @@
+"""
+Database utility functions for Returno Face Recognition System
+Handles database initialization, migrations, and common operations
+"""
+
+import time
+import logging
+from contextlib import contextmanager
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from app.models.models import db
+
+logger = logging.getLogger(__name__)
+
+
+def init_database(app):
+    """Initialize database with application context"""
+    with app.app_context():
+        try:
+            # Create all tables
+            db.create_all()
+            logger.info("Database tables created successfully")
+            
+            # Create default admin user if not exists
+            create_default_admin()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            return False
+
+
+def create_default_admin():
+    """Create default admin user if not exists"""
+    from app.models.models import User, UserRole
+    
+    try:
+        # Check if admin exists
+        admin = User.query.filter_by(username='admin').first()
+        
+        if not admin:
+            admin = User(
+                username='admin',
+                email='admin@returno.local',
+                full_name='System Administrator',
+                role=UserRole.ADMIN,
+                is_active=True,
+                is_verified=True
+            )
+            admin.set_password('admin123')  # Change in production!
+            
+            db.session.add(admin)
+            db.session.commit()
+            
+            logger.info("Default admin user created")
+            logger.warning("IMPORTANT: Change default admin password in production!")
+        else:
+            logger.info("Admin user already exists")
+            
+    except Exception as e:
+        logger.error(f"Error creating default admin: {e}")
+        db.session.rollback()
+
+
+@contextmanager
+def db_transaction():
+    """Context manager for database transactions with automatic rollback"""
+    try:
+        yield db.session
+        db.session.commit()
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        logger.error(f"Database transaction error: {e}")
+        raise
+    finally:
+        db.session.close()
+
+
+def retry_on_db_lock(func, max_retries=3, delay=0.1):
+    """Retry function on database lock with exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except OperationalError as e:
+            if 'database is locked' in str(e) and attempt < max_retries - 1:
+                wait_time = delay * (2 ** attempt)
+                logger.warning(f"Database locked, retrying in {wait_time}s... (attempt {attempt + 1})")
+                time.sleep(wait_time)
+            else:
+                raise
+    
+    raise OperationalError("Max retries exceeded for database operation")
+
+
+# SQLite-specific optimizations
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Set SQLite pragmas for better performance"""
+    cursor = dbapi_conn.cursor()
+    # Enable foreign key constraints
+    cursor.execute("PRAGMA foreign_keys=ON")
+    # Set journal mode to WAL for better concurrency
+    cursor.execute("PRAGMA journal_mode=WAL")
+    # Set synchronous to NORMAL for better performance
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    # Increase cache size (in KB)
+    cursor.execute("PRAGMA cache_size=10000")
+    cursor.close()
+
+
+def validate_database_connection():
+    """Validate database connection"""
+    try:
+        # Simple query to test connection
+        db.session.execute('SELECT 1')
+        logger.info("Database connection validated")
+        return True
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        return False
+
+
+def get_table_counts():
+    """Get record counts for all tables"""
+    from app.models.models import (
+        User, MissingReport, FileAttachment, MatchResult,
+        Notification, ConsentLog, AuditLog, SuccessStory
+    )
+    
+    counts = {
+        'users': User.query.count(),
+        'missing_reports': MissingReport.query.count(),
+        'file_attachments': FileAttachment.query.count(),
+        'match_results': MatchResult.query.count(),
+        'notifications': Notification.query.count(),
+        'consent_logs': ConsentLog.query.count(),
+        'audit_logs': AuditLog.query.count(),
+        'success_stories': SuccessStory.query.count()
+    }
+    
+    return counts
+
+
+def cleanup_old_data(days=10):
+    """Clean up old data based on retention policy"""
+    from datetime import datetime, timedelta
+    from app.models.models import MissingReport, ReportStatus, AuditLog
+    
+    try:
+        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        
+        # Find reports scheduled for deletion
+        reports_to_delete = MissingReport.query.filter(
+            MissingReport.scheduled_deletion_date <= datetime.utcnow(),
+            MissingReport.status == ReportStatus.CLOSED
+        ).all()
+        
+        deleted_count = 0
+        for report in reports_to_delete:
+            # Log deletion
+            AuditLog.log_action(
+                user_id=None,
+                action_type='auto_delete_report',
+                details=f'Report {report.id} auto-deleted per retention policy',
+                resource_type='report',
+                resource_id=report.id
+            )
+            
+            # Soft delete
+            report.soft_delete(reason='Data retention policy')
+            deleted_count += 1
+        
+        if deleted_count > 0:
+            db.session.commit()
+            logger.info(f"Auto-deleted {deleted_count} old reports")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up old data: {e}")
+        db.session.rollback()
+        return 0
+
+
+def backup_database(backup_path=None):
+    """Create database backup (SQLite specific)"""
+    import shutil
+    from config.config import Config
+    
+    try:
+        if backup_path is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = f'database/backup_returno_{timestamp}.db'
+        
+        # Get database path from config
+        db_path = Config.SQLALCHEMY_DATABASE_URI.replace('sqlite:///', '')
+        
+        # Copy database file
+        shutil.copy2(db_path, backup_path)
+        logger.info(f"Database backed up to {backup_path}")
+        
+        return backup_path
+        
+    except Exception as e:
+        logger.error(f"Error backing up database: {e}")
+        return None
+
+
+def execute_raw_query(query, params=None):
+    """Execute raw SQL query safely with parameters"""
+    try:
+        if params:
+            result = db.session.execute(query, params)
+        else:
+            result = db.session.execute(query)
+        
+        db.session.commit()
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error executing query: {e}")
+        db.session.rollback()
+        raise
+
+
+def get_database_size():
+    """Get database file size in MB"""
+    import os
+    from config.config import Config
+    
+    try:
+        db_path = Config.SQLALCHEMY_DATABASE_URI.replace('sqlite:///', '')
+        if os.path.exists(db_path):
+            size_bytes = os.path.getsize(db_path)
+            size_mb = size_bytes / (1024 * 1024)
+            return round(size_mb, 2)
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting database size: {e}")
+        return 0
+
+
+def vacuum_database():
+    """Optimize database by running VACUUM (SQLite)"""
+    try:
+        db.session.execute('VACUUM')
+        logger.info("Database vacuumed successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error vacuuming database: {e}")
+        return False
+
+
+class DatabaseHealthCheck:
+    """Database health check utility"""
+    
+    @staticmethod
+    def check_all():
+        """Run all health checks"""
+        results = {
+            'connection': False,
+            'tables_exist': False,
+            'admin_exists': False,
+            'size_mb': 0,
+            'record_counts': {}
+        }
+        
+        try:
+            # Check connection
+            results['connection'] = validate_database_connection()
+            
+            # Check if tables exist
+            from app.models.models import User
+            results['tables_exist'] = User.query.count() >= 0
+            
+            # Check if admin exists
+            admin = User.query.filter_by(username='admin').first()
+            results['admin_exists'] = admin is not None
+            
+            # Get database size
+            results['size_mb'] = get_database_size()
+            
+            # Get record counts
+            results['record_counts'] = get_table_counts()
+            
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+        
+        return results
