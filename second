@@ -1,0 +1,573 @@
+"""
+Database Models for Returno Face Recognition System
+Implements all required database tables with security and audit features
+"""
+
+from datetime import datetime, timedelta
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import Column, Integer, String, Text, Float, Boolean, DateTime, ForeignKey, Enum
+from sqlalchemy.orm import relationship
+from werkzeug.security import generate_password_hash, check_password_hash
+import enum
+import json
+
+db = SQLAlchemy()
+
+
+class UserRole(enum.Enum):
+    """User role enumeration"""
+    PUBLIC_REPORTER = "public_reporter"
+    GUARDIAN = "guardian"
+    ADMIN = "admin"
+
+
+class ReportStatus(enum.Enum):
+    """Report status enumeration"""
+    PENDING = "pending"
+    ACTIVE = "active"
+    MATCHED = "matched"
+    CLOSED = "closed"
+    DELETED = "deleted"  # Soft delete
+
+
+class MatchStatus(enum.Enum):
+    """Match result status"""
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    FALSE_POSITIVE = "false_positive"
+
+
+class NotificationStatus(enum.Enum):
+    """Notification status"""
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    SENT = "sent"
+    FAILED = "failed"
+
+
+# Base Model with common fields
+class BaseModel(db.Model):
+    """Base model with common fields"""
+    __abstract__ = True
+    
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        """Convert model to dictionary"""
+        return {
+            column.name: getattr(self, column.name)
+            for column in self.__table__.columns
+        }
+
+
+class User(BaseModel):
+    """User model for authentication and authorization"""
+    __tablename__ = 'users'
+    
+    username = Column(String(80), unique=True, nullable=False, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(Enum(UserRole), nullable=False, default=UserRole.PUBLIC_REPORTER)
+    
+    # Personal information (encrypted in production)
+    full_name = Column(String(200), nullable=False)
+    phone = Column(String(20))
+    
+    # Account status
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+    last_login = Column(DateTime)
+    
+    # Relationships
+    reports = relationship('MissingReport', back_populates='reporter', lazy='dynamic')
+    consent_logs = relationship('ConsentLog', back_populates='user', lazy='dynamic')
+    
+    def set_password(self, password):
+        """Hash and set password"""
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        """Verify password"""
+        return check_password_hash(self.password_hash, password)
+    
+    def to_dict(self, include_sensitive=False):
+        """Convert to dictionary with option to exclude sensitive data"""
+        data = {
+            'id': self.id,
+            'username': self.username,
+            'role': self.role.value,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat()
+        }
+        
+        if include_sensitive:
+            data.update({
+                'email': self.email,
+                'full_name': self.full_name,
+                'phone': self.phone,
+                'last_login': self.last_login.isoformat() if self.last_login else None
+            })
+        
+        return data
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+
+class MissingReport(BaseModel):
+    """Missing person report model"""
+    __tablename__ = 'missing_reports'
+    
+    # Reporter information
+    reporter_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    
+    # Guardian information (if reporter is not guardian)
+    guardian_name = Column(String(200))
+    guardian_age = Column(Integer)
+    guardian_national_id = Column(String(50))  # Encrypted
+    guardian_phone = Column(String(20))  # Encrypted
+    relationship_to_missing = Column(String(100))
+    
+    # Missing person information
+    missing_person_name = Column(String(200), nullable=False)
+    missing_person_age = Column(Integer, nullable=False)
+    missing_person_national_id = Column(String(50))  # Encrypted
+    last_seen_location = Column(Text, nullable=False)
+    last_seen_date = Column(DateTime)
+    description = Column(Text)
+    
+    # Report metadata
+    status = Column(Enum(ReportStatus), nullable=False, default=ReportStatus.PENDING)
+    priority = Column(Integer, default=1)  # 1=Low, 2=Medium, 3=High
+    
+    # Soft delete
+    deleted_at = Column(DateTime, nullable=True)
+    deletion_reason = Column(Text)
+    
+    # Auto-deletion for data retention
+    scheduled_deletion_date = Column(DateTime)
+    
+    # Abuse tracking
+    is_flagged = Column(Boolean, default=False)
+    flag_reason = Column(Text)
+    
+    # Relationships
+    reporter = relationship('User', back_populates='reports')
+    file_attachments = relationship('FileAttachment', back_populates='report', lazy='dynamic',
+                                   cascade='all, delete-orphan')
+    match_results = relationship('MatchResult', back_populates='report', lazy='dynamic',
+                                cascade='all, delete-orphan')
+    consent_logs = relationship('ConsentLog', back_populates='report', lazy='dynamic')
+    
+    def set_scheduled_deletion(self, days=None):
+        """Set scheduled deletion date based on config"""
+        from config.config import Config
+        days = days or Config.DATA_RETENTION_DAYS
+        self.scheduled_deletion_date = datetime.utcnow() + timedelta(days=days)
+    
+    def soft_delete(self, reason=None):
+        """Soft delete the report"""
+        self.status = ReportStatus.DELETED
+        self.deleted_at = datetime.utcnow()
+        self.deletion_reason = reason
+    
+    def to_dict(self, include_pii=False):
+        """Convert to dictionary with PII protection"""
+        data = {
+            'id': self.id,
+            'status': self.status.value,
+            'last_seen_location': self.last_seen_location,
+            'description': self.description,
+            'priority': self.priority,
+            'created_at': self.created_at.isoformat(),
+            'is_flagged': self.is_flagged
+        }
+        
+        if include_pii:
+            data.update({
+                'reporter_id': self.reporter_id,
+                'guardian_name': self.guardian_name,
+                'guardian_phone': self.guardian_phone,
+                'missing_person_name': self.missing_person_name,
+                'missing_person_age': self.missing_person_age,
+                'missing_person_national_id': self.missing_person_national_id,
+            })
+        else:
+            # Redact PII for public view
+            data.update({
+                'missing_person_name': 'REDACTED',
+                'missing_person_age': self.missing_person_age,
+            })
+        
+        return data
+    
+    def __repr__(self):
+        return f'<MissingReport {self.id}>'
+
+
+class FileAttachment(BaseModel):
+    """File attachments for reports (photos and voice recordings)"""
+    __tablename__ = 'file_attachments'
+    
+    report_id = Column(Integer, ForeignKey('missing_reports.id'), nullable=False)
+    
+    file_type = Column(String(20), nullable=False)  # 'photo' or 'voice'
+    file_path = Column(String(500), nullable=False)
+    file_name = Column(String(255), nullable=False)
+    file_size = Column(Integer)  # Size in bytes
+    mime_type = Column(String(100))
+    
+    # AI Processing results
+    is_processed = Column(Boolean, default=False)
+    processing_error = Column(Text)
+    
+    # For photos: face detection results
+    face_detected = Column(Boolean)
+    face_encoding = Column(Text)  # JSON string of face encoding
+    
+    # For voice: voice print results
+    voice_detected = Column(Boolean)
+    voice_encoding = Column(Text)  # JSON string of voice encoding
+    
+    # Relationships
+    report = relationship('MissingReport', back_populates='file_attachments')
+    ai_metrics = relationship('AIConfidenceMetrics', back_populates='file_attachment',
+                            uselist=False, cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        return {
+            'id': self.id,
+            'report_id': self.report_id,
+            'file_type': self.file_type,
+            'file_name': self.file_name,
+            'file_size': self.file_size,
+            'is_processed': self.is_processed,
+            'created_at': self.created_at.isoformat()
+        }
+    
+    def __repr__(self):
+        return f'<FileAttachment {self.id} - {self.file_type}>'
+
+
+class MatchResult(BaseModel):
+    """Match results between reports and found persons"""
+    __tablename__ = 'match_results'
+    
+    # Source report
+    report_id = Column(Integer, ForeignKey('missing_reports.id'), nullable=False)
+    
+    # Match details
+    matched_identity = Column(String(200))
+    confidence_score = Column(Float, nullable=False)
+    match_type = Column(String(20))  # 'face', 'voice', 'both'
+    
+    # Match source (uploaded photo/voice or live recognition)
+    source_type = Column(String(50))  # 'photo_upload', 'voice_upload', 'live_camera'
+    source_file_path = Column(String(500))
+    
+    # Status and review
+    status = Column(Enum(MatchStatus), nullable=False, default=MatchStatus.PENDING_REVIEW)
+    reviewed_by_admin_id = Column(Integer, ForeignKey('users.id'))
+    reviewed_at = Column(DateTime)
+    review_notes = Column(Text)
+    
+    # False positive tracking
+    is_false_positive = Column(Boolean, default=False)
+    false_positive_reason = Column(Text)
+    
+    # Duplicate detection
+    is_duplicate = Column(Boolean, default=False)
+    original_match_id = Column(Integer, ForeignKey('match_results.id'))
+    
+    # Relationships
+    report = relationship('MissingReport', back_populates='match_results')
+    reviewed_by = relationship('User', foreign_keys=[reviewed_by_admin_id])
+    notifications = relationship('Notification', back_populates='match_result',
+                                cascade='all, delete-orphan')
+    audit_logs = relationship('AuditLog', back_populates='match_result', lazy='dynamic')
+    
+    def approve_match(self, admin_id, notes=None):
+        """Approve the match"""
+        self.status = MatchStatus.APPROVED
+        self.reviewed_by_admin_id = admin_id
+        self.reviewed_at = datetime.utcnow()
+        self.review_notes = notes
+    
+    def reject_match(self, admin_id, reason):
+        """Reject the match"""
+        self.status = MatchStatus.REJECTED
+        self.reviewed_by_admin_id = admin_id
+        self.reviewed_at = datetime.utcnow()
+        self.review_notes = reason
+    
+    def mark_false_positive(self, admin_id, reason):
+        """Mark as false positive"""
+        self.status = MatchStatus.FALSE_POSITIVE
+        self.is_false_positive = True
+        self.false_positive_reason = reason
+        self.reviewed_by_admin_id = admin_id
+        self.reviewed_at = datetime.utcnow()
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        return {
+            'id': self.id,
+            'report_id': self.report_id,
+            'confidence_score': self.confidence_score,
+            'match_type': self.match_type,
+            'status': self.status.value,
+            'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
+            'is_false_positive': self.is_false_positive,
+            'created_at': self.created_at.isoformat()
+        }
+    
+    def __repr__(self):
+        return f'<MatchResult {self.id} - {self.confidence_score:.2f}>'
+
+
+class Notification(BaseModel):
+    """Notifications to guardians about matches"""
+    __tablename__ = 'notifications'
+    
+    match_result_id = Column(Integer, ForeignKey('match_results.id'), nullable=False)
+    
+    # Notification details
+    recipient_name = Column(String(200), nullable=False)
+    recipient_phone = Column(String(20))  # Encrypted
+    recipient_email = Column(String(120))  # Encrypted
+    
+    message_content = Column(Text, nullable=False)
+    notification_type = Column(String(50))  # 'sms', 'email', 'both'
+    
+    # Admin approval required
+    status = Column(Enum(NotificationStatus), nullable=False,
+                   default=NotificationStatus.PENDING_APPROVAL)
+    approved_by_admin_id = Column(Integer, ForeignKey('users.id'))
+    approved_at = Column(DateTime)
+    
+    # Sending details
+    sent_at = Column(DateTime)
+    delivery_status = Column(String(50))
+    delivery_error = Column(Text)
+    
+    # Relationships
+    match_result = relationship('MatchResult', back_populates='notifications')
+    approved_by = relationship('User', foreign_keys=[approved_by_admin_id])
+    admin_approval = relationship('AdminApproval', back_populates='notification',
+                                 uselist=False, cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        return {
+            'id': self.id,
+            'match_result_id': self.match_result_id,
+            'status': self.status.value,
+            'notification_type': self.notification_type,
+            'approved_at': self.approved_at.isoformat() if self.approved_at else None,
+            'sent_at': self.sent_at.isoformat() if self.sent_at else None,
+            'created_at': self.created_at.isoformat()
+        }
+    
+    def __repr__(self):
+        return f'<Notification {self.id} - {self.status.value}>'
+
+
+class AdminApproval(BaseModel):
+    """Admin approval tracking for notifications"""
+    __tablename__ = 'admin_approvals'
+    
+    notification_id = Column(Integer, ForeignKey('notifications.id'), nullable=False)
+    admin_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    
+    action = Column(String(20), nullable=False)  # 'approve', 'reject'
+    notes = Column(Text)
+    ip_address = Column(String(50))
+    user_agent = Column(String(500))
+    
+    # Relationships
+    notification = relationship('Notification', back_populates='admin_approval')
+    admin = relationship('User', foreign_keys=[admin_id])
+    
+    def __repr__(self):
+        return f'<AdminApproval {self.id} - {self.action}>'
+
+
+class ConsentLog(BaseModel):
+    """Consent tracking for data usage"""
+    __tablename__ = 'consent_logs'
+    
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    report_id = Column(Integer, ForeignKey('missing_reports.id'))
+    
+    consent_type = Column(String(100), nullable=False)  # 'data_processing', 'ai_analysis', etc.
+    consent_given = Column(Boolean, nullable=False)
+    consent_text = Column(Text, nullable=False)
+    
+    # Guardian consent for minors
+    is_guardian_consent = Column(Boolean, default=False)
+    guardian_name = Column(String(200))
+    guardian_relationship = Column(String(100))
+    
+    # IP and device tracking
+    ip_address = Column(String(50))
+    user_agent = Column(String(500))
+    
+    # Revocation
+    revoked_at = Column(DateTime)
+    revocation_reason = Column(Text)
+    
+    # Relationships
+    user = relationship('User', back_populates='consent_logs')
+    report = relationship('MissingReport', back_populates='consent_logs')
+    
+    def revoke(self, reason=None):
+        """Revoke consent"""
+        self.revoked_at = datetime.utcnow()
+        self.revocation_reason = reason
+    
+    def __repr__(self):
+        return f'<ConsentLog {self.id} - {self.consent_type}>'
+
+
+class AIConfidenceMetrics(BaseModel):
+    """AI confidence metrics and false positive indicators"""
+    __tablename__ = 'ai_confidence_metrics'
+    
+    file_attachment_id = Column(Integer, ForeignKey('file_attachments.id'), nullable=False)
+    
+    # Model information
+    model_name = Column(String(100))
+    model_version = Column(String(50))
+    
+    # Confidence scores
+    primary_confidence = Column(Float, nullable=False)
+    secondary_confidence = Column(Float)  # Second best match
+    confidence_delta = Column(Float)  # Difference between top 2
+    
+    # Quality metrics
+    image_quality_score = Column(Float)  # For photos
+    audio_quality_score = Column(Float)  # For voice
+    
+    # False positive risk indicators
+    risk_score = Column(Float)  # 0-1, higher = more likely false positive
+    risk_factors = Column(Text)  # JSON array of risk factors
+    
+    # Processing details
+    processing_time_ms = Column(Integer)
+    hardware_used = Column(String(50))  # 'cpu', 'gpu'
+    
+    # Additional metadata
+    metadata = Column(Text)  # JSON string for additional data
+    
+    # Relationships
+    file_attachment = relationship('FileAttachment', back_populates='ai_metrics')
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        return {
+            'primary_confidence': self.primary_confidence,
+            'confidence_delta': self.confidence_delta,
+            'risk_score': self.risk_score,
+            'model_name': self.model_name,
+            'processing_time_ms': self.processing_time_ms
+        }
+    
+    def __repr__(self):
+        return f'<AIConfidenceMetrics {self.id} - {self.primary_confidence:.2f}>'
+
+
+class AuditLog(BaseModel):
+    """Audit log for critical actions"""
+    __tablename__ = 'audit_logs'
+    
+    # Who performed the action
+    user_id = Column(Integer, ForeignKey('users.id'))
+    username = Column(String(80))
+    
+    # What action was performed
+    action_type = Column(String(100), nullable=False)  # 'login', 'report_create', etc.
+    action_details = Column(Text)
+    
+    # Which resource was affected
+    resource_type = Column(String(50))  # 'report', 'match', 'notification'
+    resource_id = Column(Integer)
+    
+    # Related entities
+    report_id = Column(Integer, ForeignKey('missing_reports.id'))
+    match_result_id = Column(Integer, ForeignKey('match_results.id'))
+    
+    # Request details
+    ip_address = Column(String(50))
+    user_agent = Column(String(500))
+    request_method = Column(String(10))
+    request_path = Column(String(500))
+    
+    # Result
+    success = Column(Boolean, default=True)
+    error_message = Column(Text)
+    
+    # Relationships
+    user = relationship('User', foreign_keys=[user_id])
+    report = relationship('MissingReport', foreign_keys=[report_id])
+    match_result = relationship('MatchResult', back_populates='audit_logs')
+    
+    @staticmethod
+    def log_action(user_id, action_type, details=None, resource_type=None,
+                   resource_id=None, ip_address=None, success=True):
+        """Helper method to create audit log entry"""
+        log = AuditLog(
+            user_id=user_id,
+            action_type=action_type,
+            action_details=details,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            ip_address=ip_address,
+            success=success
+        )
+        db.session.add(log)
+        return log
+    
+    def __repr__(self):
+        return f'<AuditLog {self.id} - {self.action_type}>'
+
+
+class SuccessStory(BaseModel):
+    """Success stories for public display"""
+    __tablename__ = 'success_stories'
+    
+    # Anonymous information (no PII)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, nullable=False)
+    age_group = Column(String(50))  # 'child', 'teen', 'adult', 'senior'
+    location_general = Column(String(100))  # City or region only
+    
+    # Timeline
+    missing_duration_days = Column(Integer)
+    found_date = Column(DateTime)
+    
+    # Optional image (generic, not actual person)
+    image_path = Column(String(500))
+    
+    # Display control
+    is_published = Column(Boolean, default=False)
+    views_count = Column(Integer, default=0)
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'age_group': self.age_group,
+            'location_general': self.location_general,
+            'missing_duration_days': self.missing_duration_days,
+            'found_date': self.found_date.isoformat() if self.found_date else None,
+            'created_at': self.created_at.isoformat()
+        }
+    
+    def __repr__(self):
+        return f'<SuccessStory {self.id}>'
