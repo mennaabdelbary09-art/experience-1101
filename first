@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+Project Structure Setup Script
+Creates the complete directory structure for the Returno Face Recognition System
+"""
+
+import os
+import sys
+
+def create_directory_structure():
+    """Create the project directory structure"""
+    
+    directories = [
+        # Main application directories
+        'app',
+        'app/models',
+        'app/routes',
+        'app/services',
+        'app/utils',
+        'app/middleware',
+        
+        # Configuration
+        'config',
+        
+        # Database
+        'database',
+        'database/migrations',
+        
+        # Static files and uploads
+        'uploads',
+        'uploads/photos',
+        'uploads/voices',
+        'uploads/temp',
+        
+        # Logs
+        'logs',
+        
+        # Tests
+        'tests',
+        'tests/unit',
+        'tests/integration',
+        'tests/fixtures',
+        
+        # Documentation
+        'docs',
+        'docs/api',
+        'docs/architecture',
+        
+        # Scripts
+        'scripts',
+        
+        # ML Models
+        'models',
+        'models/face_recognition',
+        'models/voice_recognition',
+    ]
+    
+    print("Creating directory structure...")
+    for directory in directories:
+        os.makedirs(directory, exist_ok=True)
+        # Create __init__.py for Python packages
+        if directory.startswith('app/') or directory.startswith('tests/'):
+            init_file = os.path.join(directory, '__init__.py')
+            if not os.path.exists(init_file):
+                open(init_file, 'a').close()
+        print(f"✓ Created {directory}")
+    
+    print("\n✓ Directory structure created successfully!")
+    print("\nNext steps:")
+    print("1. Run: python setup_dependencies.py")
+    print("2. Copy your saved_model.h5 to models/face_recognition/")
+    print("3. Configure .env file with your settings")
+    print("4. Run: python scripts/init_database.py")
+    print("5. Run: python app.py")
+
+if __name__ == "__main__":
+    try:
+        create_directory_structure()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
